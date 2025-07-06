@@ -112,6 +112,49 @@ results[0].show()  # Display results
 path = model.export(format="onnx")  # Returns the path to the exported model
 ```
 
+##Distialltion
+
+Dưới đây là phiên bản viết lại rõ ràng và chuyên nghiệp hơn:
+
+---
+
+**To enable the Distillation version of the YOLO model, follow these two steps:**
+
+* **Step 1:** If you're using Ultralytics version `8.3.162`, copy the `trainer.py` file from the path `ultralytics/ultralytics/engine/trainer.py` in the distillation source into the corresponding path in the original Ultralytics repository.
+  If you're using a newer version, review the changes in the `trainer.py` file and adapt them accordingly to ensure compatibility with the latest Ultralytics version.
+
+* **Step 2:** Open the `default.yaml` configuration file located at `ultralytics/ultralytics/cfg/default.yaml`, and add the following two arguments:
+
+  ```yaml
+  teacher: None
+  distillation_loss: None
+  ```
+
+  These parameters are required to enable and configure the distillation functionality.
+
+### How to Run
+
+Example:
+
+```
+from ultralytics import YOLO
+
+teacher_model = YOLO("<teacher-path>")
+
+student_model = YOLO("yolo11n.pt)
+
+student_model.train(
+    data="<data-path>",
+    teacher=teacher_model.model, # None if you don't wanna use knowledge distillation
+    distillation_loss="cwd",
+    epochs=100,
+    batch=16,
+    workers=0,
+    exist_ok=True,
+)
+```
+
+
 Discover more examples in the YOLO [Python Docs](https://docs.ultralytics.com/usage/python/).
 
 </details>
