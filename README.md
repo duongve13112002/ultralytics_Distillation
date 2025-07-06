@@ -114,9 +114,6 @@ path = model.export(format="onnx")  # Returns the path to the exported model
 
 ## Distialltion
 
-Dưới đây là phiên bản viết lại rõ ràng và chuyên nghiệp hơn:
-
----
 
 **To enable the Distillation version of the YOLO model, follow these two steps:**
 
@@ -141,12 +138,12 @@ from ultralytics import YOLO
 
 teacher_model = YOLO("<teacher-path>")
 
-student_model = YOLO("yolo11n.pt)
+student_model = YOLO("yolo11n.pt")
 
 student_model.train(
     data="<data-path>",
     teacher=teacher_model.model, # None if you don't wanna use knowledge distillation
-    distillation_loss="cwd",
+    distillation_loss="cwd", #There are two distillation loss "cwd" or "mgd"
     epochs=100,
     batch=16,
     workers=0,
