@@ -112,7 +112,7 @@ results[0].show()  # Display results
 path = model.export(format="onnx")  # Returns the path to the exported model
 ```
 
-##Distialltion
+## Distialltion
 
 Dưới đây là phiên bản viết lại rõ ràng và chuyên nghiệp hơn:
 
