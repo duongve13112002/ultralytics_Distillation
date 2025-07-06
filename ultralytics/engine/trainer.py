@@ -124,28 +124,16 @@ class MGDLoss(nn.Module):
         Return:
             torch.Tensor: The calculated loss value of all stages.
         """
-        min_len = min(len(y_s), len(y_t))
-        y_s = y_s[:min_len]
-        y_t = y_t[:min_len]
-
-        tea_feats = []
-        stu_feats = []
-
+        losses = []
         for idx, (s, t) in enumerate(zip(y_s, y_t)):
-            s = s.type(next(self.align_module[idx].parameters()).dtype)
-            t = t.type(next(self.align_module[idx].parameters()).dtype)
-
-            if self.distiller == "cwd":
-                s = self.align_module[idx](s)
-                stu_feats.append(s)
-                tea_feats.append(t.detach())
-            else:
-                t = self.norm[idx](t)  # ✅ Correct normalization
-                stu_feats.append(s)
-                tea_feats.append(t.detach())
-
-        loss = self.feature_loss(stu_feats, tea_feats)
-        return self.loss_weight * loss
+            # print(s.shape)
+            # print(t.shape)
+            # assert s.shape == t.shape
+            if layer == "outlayer":
+                idx = -1
+            losses.append(self.get_dis_loss(s, t, idx) * self.alpha_mgd)
+        loss = sum(losses)
+        return loss
 
     def get_dis_loss(self, preds_S, preds_T, idx):
         loss_mse = nn.MSELoss(reduction='sum')
@@ -199,25 +187,23 @@ class FeatureLoss(nn.Module):
             raise NotImplementedError
 
     def forward(self, y_s, y_t):
-        if len(y_s) != len(y_t):
-            y_t = y_t[len(y_t) // 2:]
+        min_len = min(len(y_s), len(y_t))
+        y_s = y_s[:min_len]
+        y_t = y_t[:min_len]
 
         tea_feats = []
         stu_feats = []
 
         for idx, (s, t) in enumerate(zip(y_s, y_t)):
-            # Match input dtype to module dtype
             s = s.type(next(self.align_module[idx].parameters()).dtype)
             t = t.type(next(self.align_module[idx].parameters()).dtype)
 
             if self.distiller == "cwd":
-                # Apply alignment and normalization
                 s = self.align_module[idx](s)
                 stu_feats.append(s)
                 tea_feats.append(t.detach())
             else:
-                # Apply normalization
-                t = self.norm1[idx](t)
+                t = self.norm[idx](t)  # ✅ Correct normalization
                 stu_feats.append(s)
                 tea_feats.append(t.detach())
 
@@ -839,7 +825,7 @@ class BaseTrainer:
         if self.teacher is not None:
             distillation_loss.remove_handle_()
         unset_deterministic()
-        
+
         self.run_callbacks("teardown")
 
     def auto_batch(self, max_num_obj=0):
