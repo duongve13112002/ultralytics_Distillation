@@ -143,7 +143,7 @@ student_model = YOLO("yolo11n.pt")
 student_model.train(
     data="<data-path>",
     teacher=teacher_model.model, # None if you don't wanna use knowledge distillation
-    distillation_loss="cwd", #There are two distillation loss "cwd" or "mgd"
+    distillation_loss="cwd", #There are two distillation loss "cwd" or "mgd" (mgd usually get better result)
     epochs=100,
     batch=16,
     workers=0,
