@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, optim
 
@@ -54,6 +55,295 @@ from ultralytics.utils.torch_utils import (
     torch_distributed_zero_first,
     unset_deterministic,
 )
+
+class CWDLoss(nn.Module):
+    """PyTorch version of `Channel-wise Distillation for Semantic Segmentation.
+    <https://arxiv.org/abs/2011.13256>`_.
+    """
+
+    def __init__(self, channels_s, channels_t, tau=1.0):
+        super().__init__()
+        self.tau = tau
+
+    def forward(self, y_s, y_t):
+        """Forward computation.
+        Args:
+            y_s (list): The student model prediction with
+                shape (N, C, H, W) in list.
+            y_t (list): The teacher model prediction with
+                shape (N, C, H, W) in list.
+        Return:
+            torch.Tensor: The calculated loss value of all stages.
+        """
+        assert len(y_s) == len(y_t)
+        losses = []
+
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            assert s.shape == t.shape
+            N, C, H, W = s.shape
+
+            # normalize in channel dimension
+            softmax_pred_T = F.softmax(t.view(-1, W * H) / self.tau, dim=1)
+
+            logsoftmax = torch.nn.LogSoftmax(dim=1)
+            cost = torch.sum(
+                softmax_pred_T * logsoftmax(t.view(-1, W * H) / self.tau) -
+                softmax_pred_T * logsoftmax(s.view(-1, W * H) / self.tau)) * (self.tau ** 2)
+
+            losses.append(cost / (C * N))
+        loss = sum(losses)
+        return loss
+
+class MGDLoss(nn.Module):
+    def __init__(self,
+                 student_channels,
+                 teacher_channels,
+                 alpha_mgd=0.00002,
+                 lambda_mgd=0.65,
+                 ):
+        super(MGDLoss, self).__init__()
+        self.alpha_mgd = alpha_mgd
+        self.lambda_mgd = lambda_mgd
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        self.generation = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(s_chan, t_chan, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(t_chan, t_chan, kernel_size=3, padding=1)
+            ).to(device) for s_chan, t_chan in zip(student_channels, teacher_channels)
+        ])
+
+    def forward(self, y_s, y_t, layer=None):
+        """Forward computation.
+        Args:
+            y_s (list): The student model prediction with
+                shape (N, C, H, W) in list.
+            y_t (list): The teacher model prediction with
+                shape (N, C, H, W) in list.
+        Return:
+            torch.Tensor: The calculated loss value of all stages.
+        """
+        min_len = min(len(y_s), len(y_t))
+        y_s = y_s[:min_len]
+        y_t = y_t[:min_len]
+
+        tea_feats = []
+        stu_feats = []
+
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            s = s.type(next(self.align_module[idx].parameters()).dtype)
+            t = t.type(next(self.align_module[idx].parameters()).dtype)
+
+            if self.distiller == "cwd":
+                s = self.align_module[idx](s)
+                stu_feats.append(s)
+                tea_feats.append(t.detach())
+            else:
+                t = self.norm[idx](t)  # ✅ Correct normalization
+                stu_feats.append(s)
+                tea_feats.append(t.detach())
+
+        loss = self.feature_loss(stu_feats, tea_feats)
+        return self.loss_weight * loss
+
+    def get_dis_loss(self, preds_S, preds_T, idx):
+        loss_mse = nn.MSELoss(reduction='sum')
+        N, C, H, W = preds_T.shape
+
+        device = preds_S.device
+        mat = torch.rand((N, 1, H, W)).to(device)
+        mat = torch.where(mat > 1 - self.lambda_mgd, 0, 1).to(device)
+
+        masked_fea = torch.mul(preds_S, mat)
+        new_fea = self.generation[idx](masked_fea)
+
+        dis_loss = loss_mse(new_fea, preds_T) / N
+        return dis_loss
+
+
+class FeatureLoss(nn.Module):
+    def __init__(self, channels_s, channels_t, distiller='mgd', loss_weight=1.0):
+        super(FeatureLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.distiller = distiller
+
+        # Move all modules to same precision
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # Convert to ModuleList and ensure consistent dtype
+        self.align_module = nn.ModuleList()
+        self.norm = nn.ModuleList()
+        self.norm1 = nn.ModuleList()
+
+        # Create alignment modules
+        for s_chan, t_chan in zip(channels_s, channels_t):
+            align = nn.Sequential(
+                nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0),
+                nn.BatchNorm2d(t_chan, affine=False)
+            ).to(device)
+            self.align_module.append(align)
+
+        # Create normalization layers
+        for t_chan in channels_t:
+            self.norm.append(nn.BatchNorm2d(t_chan, affine=False).to(device))
+
+        for s_chan in channels_s:
+            self.norm1.append(nn.BatchNorm2d(s_chan, affine=False).to(device))
+
+        if distiller == 'mgd':
+            self.feature_loss = MGDLoss(channels_s, channels_t)
+        elif distiller == 'cwd':
+            self.feature_loss = CWDLoss(channels_s, channels_t)
+        else:
+            raise NotImplementedError
+
+    def forward(self, y_s, y_t):
+        if len(y_s) != len(y_t):
+            y_t = y_t[len(y_t) // 2:]
+
+        tea_feats = []
+        stu_feats = []
+
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            # Match input dtype to module dtype
+            s = s.type(next(self.align_module[idx].parameters()).dtype)
+            t = t.type(next(self.align_module[idx].parameters()).dtype)
+
+            if self.distiller == "cwd":
+                # Apply alignment and normalization
+                s = self.align_module[idx](s)
+                stu_feats.append(s)
+                tea_feats.append(t.detach())
+            else:
+                # Apply normalization
+                t = self.norm1[idx](t)
+                stu_feats.append(s)
+                tea_feats.append(t.detach())
+
+        loss = self.feature_loss(stu_feats, tea_feats)
+        return self.loss_weight * loss
+
+
+class DistillationLoss:
+    def __init__(self, models, modelt, distiller="CWDLoss"):
+        self.distiller = distiller
+        self.layers = ["6", "8", "13", "16", "19", "22"]
+        self.models = models
+        self.modelt = modelt
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # ini warm up
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 640, 640)
+            _ = self.models(dummy_input.to(device))
+            _ = self.modelt(dummy_input.to(device))
+
+        self.channels_s = []
+        self.channels_t = []
+        self.teacher_module_pairs = []
+        self.student_module_pairs = []
+        self.remove_handle = []
+
+        self._find_layers()
+
+        self.distill_loss_fn = FeatureLoss(
+            channels_s=self.channels_s,
+            channels_t=self.channels_t,
+            distiller=distiller[:3]
+        )
+
+    def _find_layers(self):
+
+        self.channels_s = []
+        self.channels_t = []
+        self.teacher_module_pairs = []
+        self.student_module_pairs = []
+
+        for name, ml in self.modelt.named_modules():
+            if name is not None:
+                name = name.split(".")
+                # print(name)
+
+                if name[0] != "model":
+                    continue
+                if len(name) >= 3:
+                    if name[1] in self.layers:
+                        if "cv2" in name[2]:
+                            if hasattr(ml, 'conv'):
+                                self.channels_t.append(ml.conv.out_channels)
+                                self.teacher_module_pairs.append(ml)
+        # print()
+        for name, ml in self.models.named_modules():
+            if name is not None:
+                name = name.split(".")
+                # print(name)
+                if name[0] != "model":
+                    continue
+                if len(name) >= 3:
+                    if name[1] in self.layers:
+                        if "cv2" in name[2]:
+                            if hasattr(ml, 'conv'):
+                                self.channels_s.append(ml.conv.out_channels)
+                                self.student_module_pairs.append(ml)
+
+        nl = min(len(self.channels_s), len(self.channels_t))
+        self.channels_s = self.channels_s[-nl:]
+        self.channels_t = self.channels_t[-nl:]
+        self.teacher_module_pairs = self.teacher_module_pairs[-nl:]
+        self.student_module_pairs = self.student_module_pairs[-nl:]
+
+    def register_hook(self):
+        # Remove the existing hook if they exist
+        self.remove_handle_()
+
+        self.teacher_outputs = []
+        self.student_outputs = []
+
+        def make_student_hook(l):
+            def forward_hook(m, input, output):
+                if isinstance(output, torch.Tensor):
+                    out = output.clone()  # Clone to ensure we don't modify the original
+                    l.append(out)
+                else:
+                    l.append([o.clone() if isinstance(o, torch.Tensor) else o for o in output])
+            return forward_hook
+
+        def make_teacher_hook(l):
+            def forward_hook(m, input, output):
+                if isinstance(output, torch.Tensor):
+                    l.append(output.detach().clone())  # Detach and clone teacher outputs
+                else:
+                    l.append([o.detach().clone() if isinstance(o, torch.Tensor) else o for o in output])
+            return forward_hook
+
+        for ml, ori in zip(self.teacher_module_pairs, self.student_module_pairs):
+            self.remove_handle.append(ml.register_forward_hook(make_teacher_hook(self.teacher_outputs)))
+            self.remove_handle.append(ori.register_forward_hook(make_student_hook(self.student_outputs)))
+
+    def get_loss(self):
+        if not self.teacher_outputs or not self.student_outputs:
+            return torch.tensor(0.0, requires_grad=True)
+
+        if len(self.teacher_outputs) != len(self.student_outputs):
+            print(f"Warning: Mismatched outputs - Teacher: {len(self.teacher_outputs)}, Student: {len(self.student_outputs)}")
+            return torch.tensor(0.0, requires_grad=True)
+
+        quant_loss = self.distill_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
+
+        if self.distiller != 'cwd':
+            quant_loss *= 0.3
+
+        self.teacher_outputs.clear()
+        self.student_outputs.clear()
+
+        return quant_loss
+
+    def remove_handle_(self):
+        for rm in self.remove_handle:
+            rm.remove()
+        self.remove_handle.clear()
+
 
 
 class BaseTrainer:
@@ -124,6 +414,18 @@ class BaseTrainer:
         self.validator = None
         self.metrics = None
         self.plots = {}
+
+        if overrides:
+            self.teacher = overrides.get("teacher", None)
+            self.loss_type = overrides.get("distillation_loss", None)
+            if "teacher" in overrides:
+                overrides.pop("teacher")
+            if "distillation_loss" in overrides:
+                overrides.pop("distillation_loss")
+        else:
+            self.loss_type = None
+            self.teacher = None
+
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
         # Dirs
@@ -253,6 +555,13 @@ class BaseTrainer:
         self.run_callbacks("on_pretrain_routine_start")
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
+
+        # Load teacher model to device
+        if self.teacher is not None:
+            for k, v in self.teacher.named_parameters():
+                v.requires_grad = True
+            self.teacher = self.teacher.to(self.device)
+
         self.set_model_attributes()
 
         # Freeze layers
@@ -292,6 +601,9 @@ class BaseTrainer:
         )
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
+            if self.teacher is not None:
+                self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
+                temp = self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -301,6 +613,7 @@ class BaseTrainer:
         # Batch size
         if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size
             self.args.batch = self.batch_size = self.auto_batch()
+
 
         # Dataloaders
         batch_size = self.batch_size // max(world_size, 1)
@@ -328,6 +641,7 @@ class BaseTrainer:
         iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
         self.optimizer = self.build_optimizer(
             model=self.model,
+            teacher=self.teacher,
             name=self.args.optimizer,
             lr=self.args.lr0,
             momentum=self.args.momentum,
@@ -363,6 +677,11 @@ class BaseTrainer:
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+
+        # make loss
+        if self.teacher is not None:
+            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         while True:
@@ -385,6 +704,8 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+            if self.teacher is not None:
+                distillation_loss.register_hook()
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -411,6 +732,15 @@ class BaseTrainer:
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
 
+                # Add more distillation logic
+                if self.teacher is not None:
+                    distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                    with torch.no_grad():
+                        pred = self.teacher(batch['img'])
+
+                    self.d_loss = distillation_loss.get_loss()
+                    self.d_loss *- distill_weight
+                    self.loss += self.d_loss
                 # Backward
                 self.scaler.scale(self.loss).backward()
 
@@ -447,6 +777,11 @@ class BaseTrainer:
                         self.plot_training_samples(batch, ni)
 
                 self.run_callbacks("on_train_batch_end")
+
+            # More distillation logic
+            if self.teacher is not None:
+                distillation_loss.remove_handle_()
+
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
@@ -499,7 +834,12 @@ class BaseTrainer:
                 self.plot_metrics()
             self.run_callbacks("on_train_end")
         self._clear_memory()
+
+        # Distill logic
+        if self.teacher is not None:
+            distillation_loss.remove_handle_()
         unset_deterministic()
+        
         self.run_callbacks("teardown")
 
     def auto_batch(self, max_num_obj=0):
@@ -810,7 +1150,7 @@ class BaseTrainer:
             LOGGER.info("Closing dataloader mosaic")
             self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
 
-    def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
+    def build_optimizer(self, model, teacher=None, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """
         Construct an optimizer for the given model.
 
@@ -851,6 +1191,14 @@ class BaseTrainer:
                 else:  # weight (with decay)
                     g[0].append(param)
 
+        if teacher is not None:
+            for v in teacher.modules():
+                if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
+                    g[2].append(v.bias)
+                if isinstance(v, bn):  # weight (no decay)
+                    g[1].append(v.weight)
+                elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
+                    g[0].append(v.weight)
         optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
         name = {x.lower(): x for x in optimizers}.get(name.lower())
         if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
