@@ -136,14 +136,12 @@ Example:
 ```
 from ultralytics import YOLO
 
-#teacher_model = YOLO("<teacher-path>")
 
 student_model = YOLO("yolo11n.pt")
 
 student_model.train(
     data="<data-path>",
-    #teacher=teacher_model.model, # None if you don't wanna use knowledge distillation
-    teacher="<teacher-path>", 
+    teacher="<teacher-path>", # None if you don't wanna use knowledge distillation
     distillation_loss="cwd", #There are two distillation loss "cwd" or "mgd" (mgd usually get better result)
     epochs=100,
     batch=16,
