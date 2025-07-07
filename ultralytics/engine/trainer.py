@@ -246,7 +246,10 @@ class DistillationLoss:
         self.teacher_module_pairs = []
         self.student_module_pairs = []
 
-        for name, ml in self.modelt.named_modules():
+        current_modelt = self.modelt.module if isinstance(self.modelt, nn.parallel.DistributedDataParallel) else self.modelt
+        current_models = self.models.module if isinstance(self.models, nn.parallel.DistributedDataParallel) else self.models
+
+        for name, ml in current_modelt.named_modules():
             if name is not None:
                 name = name.split(".")
                 # print(name)
@@ -260,7 +263,7 @@ class DistillationLoss:
                                 self.channels_t.append(ml.conv.out_channels)
                                 self.teacher_module_pairs.append(ml)
         # print()
-        for name, ml in self.models.named_modules():
+        for name, ml in current_models.named_modules():
             if name is not None:
                 name = name.split(".")
                 # print(name)
