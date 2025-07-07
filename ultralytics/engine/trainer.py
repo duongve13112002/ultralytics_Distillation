@@ -544,9 +544,18 @@ class BaseTrainer:
 
         # Load teacher model to device
         if self.teacher is not None:
-            for k, v in self.teacher.named_parameters():
-                v.requires_grad = True
+            # DDP FIX: In DDP, self.teacher is a string path, so we must load the model in each process
+            if isinstance(self.teacher, (str, Path)):
+                # Make sure you have 'from pathlib import Path' at the top of the file
+                from ultralytics.nn.tasks import attempt_load_one_weight
+                # And 'from ultralytics.nn.tasks import attempt_load_one_weight'
+                self.teacher = attempt_load_one_weight(self.teacher)[0]  # Load model from path
+
+            # It's recommended to freeze the teacher model's weights and set it to evaluation mode
+            for param in self.teacher.parameters():
+                param.requires_grad = False
             self.teacher = self.teacher.to(self.device)
+            self.teacher.eval()
 
         self.set_model_attributes()
 
@@ -587,9 +596,9 @@ class BaseTrainer:
         )
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
-            if self.teacher is not None:
-                self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
-                temp = self.teacher.eval()
+            # if self.teacher is not None:
+            #     self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
+            #     temp = self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
