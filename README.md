@@ -112,6 +112,9 @@ results[0].show()  # Display results
 path = model.export(format="onnx")  # Returns the path to the exported model
 ```
 
+## Custom Mosaic
+Add a cusom Mosaic in ultralytics/data/agument. This function will add 4 pictures into 1 mosaic and training them without cropping
+
 ## Distialltion
 
 
