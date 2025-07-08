@@ -486,6 +486,378 @@ class BaseMixTransform:
             label["texts"] = mix_texts
         return labels
 
+class CustomMosaic(BaseMixTransform):
+    """
+    Refactored Mosaic class with letterbox resizing and no cropping
+    """
+    
+    def __init__(self, dataset, imgsz=640, p=1.0, n=4):
+        """
+        Initialize the Mosaic augmentation object.
+        
+        Args:
+            dataset (Any): The dataset on which the mosaic augmentation is applied.
+            imgsz (int): Target size for each image slot in mosaic.
+            p (float): Probability of applying the mosaic augmentation.
+            n (int): The grid size, either 3, 4, or 9.
+        """
+        assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
+        assert n in {3, 4, 9}, "grid must be equal to 3, 4, or 9."
+        super().__init__(dataset=dataset, p=p)
+        self.imgsz = imgsz
+        self.n = n
+        #self.n = random.choice([3,4,9])
+        self.buffer_enabled = self.dataset.cache != "ram"
+
+    def get_indexes(self):
+        """
+        Return a list of random indexes from the dataset for mosaic augmentation.
+
+        This method selects random image indexes either from a buffer or from the entire dataset, depending on
+        the 'buffer' parameter. It is used to choose images for creating mosaic augmentations.
+
+        Returns:
+            (List[int]): A list of random image indexes. The length of the list is n-1, where n is the number
+                of images used in the mosaic (either 3 or 8, depending on whether n is 4 or 9).
+
+        Examples:
+            >>> mosaic = Mosaic(dataset, imgsz=640, p=1.0, n=4)
+            >>> indexes = mosaic.get_indexes()
+            >>> print(len(indexes))  # Output: 3
+        """
+        if self.buffer_enabled:  # select images from buffer
+            return random.choices(list(self.dataset.buffer), k=self.n - 1)
+        else:  # select any images
+            return [random.randint(0, len(self.dataset) - 1) for _ in range(self.n - 1)]
+
+    def _mix_transform(self, labels):
+        """
+        Apply mosaic augmentation to the input image and labels.
+
+        This method combines multiple images (3, 4, or 9) into a single mosaic image based on the 'n' attribute.
+        It ensures that rectangular annotations are not present and that there are other images available for
+        mosaic augmentation.
+
+        Args:
+            labels (dict): A dictionary containing image data and annotations. Expected keys include:
+                - 'rect_shape': Should be None as rect and mosaic are mutually exclusive.
+                - 'mix_labels': A list of dictionaries containing data for other images to be used in the mosaic.
+
+        Returns:
+            (dict): A dictionary containing the mosaic-augmented image and updated annotations.
+
+        Raises:
+            AssertionError: If 'rect_shape' is not None or if 'mix_labels' is empty.
+
+        Examples:
+            >>> mosaic = Mosaic(dataset, imgsz=640, p=1.0, n=4)
+            >>> augmented_data = mosaic._mix_transform(labels)
+        """
+        assert labels.get("rect_shape", None) is None, "rect and mosaic are mutually exclusive."
+        assert len(labels.get("mix_labels", [])), "There are no other images for mosaic augment."
+        return (
+            self._mosaic3(labels) if self.n == 3 else self._mosaic4(labels) if self.n == 4 else self._mosaic9(labels)
+        )  # This code is modified for mosaic3 method.
+
+    def letterbox_resize(self, img, target_size, color=(114, 114, 114)):
+        """
+        Resize image with letterbox method to preserve aspect ratio.
+        
+        Args:
+            img (np.ndarray): Input image
+            target_size (tuple): Target size (width, height)
+            color (tuple): Padding color
+            
+        Returns:
+            tuple: (resized_image, scale_factor, padding_info)
+        """
+        h, w = img.shape[:2]
+        target_w, target_h = target_size
+        
+        # Calculate scale factor to fit image in target size
+        scale = min(target_w / w, target_h / h)
+        
+        # Calculate new size
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Resize image
+        resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Calculate padding
+        pad_w = target_w - new_w
+        pad_h = target_h - new_h
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        
+        # Add padding
+        letterbox_img = cv2.copyMakeBorder(
+            resized_img, pad_top, pad_bottom, pad_left, pad_right,
+            cv2.BORDER_CONSTANT, value=color
+        )
+        
+        return letterbox_img, scale, (pad_left, pad_top, pad_right, pad_bottom)
+
+    def _mosaic3(self, labels):
+        """
+        Create a 1x3 image mosaic with letterbox resizing and fixed output size.
+        
+        Layout: [Left] [Center] [Right]
+        Final output: imgsz x imgsz
+        
+        Args:
+            labels (dict): Labels dictionary with image and mix_labels
+            
+        Returns:
+            dict: Updated labels with mosaic image
+        """
+        mosaic_labels = []
+        
+        # Each slot is 1/3 width of final image for horizontal layout
+        slot_w = self.imgsz // 3
+        slot_h = self.imgsz
+        
+        # Create canvas for 1x3 mosaic
+        canvas = np.full((self.imgsz, self.imgsz, 3), 114, dtype=np.uint8)
+        
+        # Process each image
+        for i in range(3):
+            labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
+            img = labels_patch["img"]
+            
+            # Letterbox resize to fit slot
+            letterbox_img, scale, padding = self.letterbox_resize(img, (slot_w, slot_h))
+            
+            # Calculate position in canvas
+            if i == 0:    # Center
+                x_offset = slot_w
+                y_offset = 0
+            elif i == 1:  # Right
+                x_offset = slot_w * 2
+                y_offset = 0
+            else:         # Left (i == 2)
+                x_offset = 0
+                y_offset = 0
+            
+            # Place image in canvas
+            canvas[y_offset:y_offset + slot_h, 
+                   x_offset:x_offset + slot_w] = letterbox_img
+            
+            # Update labels with letterbox transformation
+            labels_patch = self._update_labels_letterbox(
+                labels_patch, scale, padding, x_offset, y_offset
+            )
+            mosaic_labels.append(labels_patch)
+        
+        # Combine labels
+        final_labels = self._cat_labels(mosaic_labels)
+        final_labels["img"] = canvas
+        final_labels["resized_shape"] = (self.imgsz, self.imgsz)
+        
+        return final_labels
+
+    def _mosaic4(self, labels):
+        """
+        Create a 2x2 image mosaic with letterbox resizing and fixed output size.
+        
+        Layout: [Top-Left]    [Top-Right]
+                [Bottom-Left] [Bottom-Right]
+        Final output: imgsz x imgsz
+        
+        Args:
+            labels (dict): Labels dictionary with image and mix_labels
+            
+        Returns:
+            dict: Updated labels with mosaic image
+        """
+        mosaic_labels = []
+        
+        # Each slot is 1/2 of final image size for 2x2 layout
+        slot_size = self.imgsz // 2
+        
+        # Create canvas for 2x2 mosaic
+        canvas = np.full((self.imgsz, self.imgsz, 3), 114, dtype=np.uint8)
+        
+        # Define positions for 2x2 grid
+        positions = [
+            (0, 0),                    # Top-left
+            (slot_size, 0),            # Top-right
+            (0, slot_size),            # Bottom-left
+            (slot_size, slot_size)     # Bottom-right
+        ]
+        
+        # Process each image
+        for i in range(4):
+            labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
+            img = labels_patch["img"]
+            
+            # Letterbox resize to fit slot
+            letterbox_img, scale, padding = self.letterbox_resize(img, (slot_size, slot_size))
+            
+            # Get position in canvas
+            x_offset, y_offset = positions[i]
+            
+            # Place image in canvas
+            canvas[y_offset:y_offset + slot_size, 
+                   x_offset:x_offset + slot_size] = letterbox_img
+            
+            # Update labels with letterbox transformation
+            labels_patch = self._update_labels_letterbox(
+                labels_patch, scale, padding, x_offset, y_offset
+            )
+            mosaic_labels.append(labels_patch)
+        
+        # Combine labels
+        final_labels = self._cat_labels(mosaic_labels)
+        final_labels["img"] = canvas
+        final_labels["resized_shape"] = (self.imgsz, self.imgsz)
+        
+        return final_labels
+
+    def _mosaic9(self, labels):
+        """
+        Create a 3x3 image mosaic with letterbox resizing and fixed output size.
+        
+        Layout: [0] [1] [2]
+                [3] [4] [5]
+                [6] [7] [8]
+        Final output: imgsz x imgsz
+        
+        Args:
+            labels (dict): Labels dictionary with image and mix_labels
+            
+        Returns:
+            dict: Updated labels with mosaic image
+        """
+        mosaic_labels = []
+        
+        # Each slot is 1/3 of final image size for 3x3 layout
+        slot_size = self.imgsz // 3
+        
+        # Create canvas for 3x3 mosaic
+        canvas = np.full((self.imgsz, self.imgsz, 3), 114, dtype=np.uint8)
+        
+        # Define positions for 3x3 grid
+        positions = []
+        for row in range(3):
+            for col in range(3):
+                positions.append((col * slot_size, row * slot_size))
+        
+        # Process each image
+        for i in range(9):
+            labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
+            img = labels_patch["img"]
+            
+            # Letterbox resize to fit slot
+            letterbox_img, scale, padding = self.letterbox_resize(img, (slot_size, slot_size))
+            
+            # Get position in canvas
+            x_offset, y_offset = positions[i]
+            
+            # Place image in canvas
+            canvas[y_offset:y_offset + slot_size, 
+                   x_offset:x_offset + slot_size] = letterbox_img
+            
+            # Update labels with letterbox transformation
+            labels_patch = self._update_labels_letterbox(
+                labels_patch, scale, padding, x_offset, y_offset
+            )
+            mosaic_labels.append(labels_patch)
+        
+        # Combine labels
+        final_labels = self._cat_labels(mosaic_labels)
+        final_labels["img"] = canvas
+        final_labels["resized_shape"] = (self.imgsz, self.imgsz)
+        
+        return final_labels
+
+    def _update_labels_letterbox(self, labels, scale, padding, x_offset, y_offset):
+        """
+        Update labels with letterbox transformation and canvas offset.
+        
+        Args:
+            labels (dict): Original labels
+            scale (float): Scale factor from letterbox resize
+            padding (tuple): Padding values (left, top, right, bottom)
+            x_offset (int): X offset in canvas
+            y_offset (int): Y offset in canvas
+            
+        Returns:
+            dict: Updated labels
+        """
+        if "instances" not in labels:
+            return labels
+        
+        # Get original image dimensions
+        h, w = labels["img"].shape[:2]
+        
+        # Convert to absolute coordinates if normalized
+        labels["instances"].denormalize(w, h)
+        
+        # Convert to xyxy format for easier transformation
+        labels["instances"].convert_bbox(format="xyxy")
+        
+        # Apply scaling
+        labels["instances"].scale(scale, scale, bbox_only=False)
+        
+        # Apply letterbox padding
+        pad_left, pad_top, pad_right, pad_bottom = padding
+        labels["instances"].add_padding(pad_left, pad_top)
+        
+        # Apply canvas offset
+        labels["instances"].add_padding(x_offset, y_offset)
+        
+        return labels
+
+    def _cat_labels(self, mosaic_labels):
+        """
+        Concatenate and process labels for mosaic augmentation.
+        No border clipping since we're not cropping the mosaic.
+        
+        Args:
+            mosaic_labels (List[Dict]): List of label dictionaries
+            
+        Returns:
+            dict: Combined labels dictionary
+        """
+        if len(mosaic_labels) == 0:
+            return {}
+        
+        cls = []
+        instances = []
+        
+        for labels in mosaic_labels:
+            if "cls" in labels:
+                cls.append(labels["cls"])
+            if "instances" in labels:
+                instances.append(labels["instances"])
+        
+        # Create final labels
+        final_labels = {
+            "im_file": mosaic_labels[0]["im_file"],
+            "ori_shape": mosaic_labels[0]["ori_shape"],
+        }
+        
+        # Concatenate classes and instances
+        if cls:
+            final_labels["cls"] = np.concatenate(cls, 0)
+        if instances:
+            final_labels["instances"] = Instances.concatenate(instances, axis=0)
+            
+            # Remove zero-area boxes (but don't clip to borders)
+            if "instances" in final_labels:
+                good = final_labels["instances"].remove_zero_area_boxes()
+                if "cls" in final_labels:
+                    final_labels["cls"] = final_labels["cls"][good]
+        
+        # Copy other fields from first image
+        if "texts" in mosaic_labels[0]:
+            final_labels["texts"] = mosaic_labels[0]["texts"]
+            
+        return final_labels
+
 
 class Mosaic(BaseMixTransform):
     """
