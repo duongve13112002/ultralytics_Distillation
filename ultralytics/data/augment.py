@@ -486,6 +486,643 @@ class BaseMixTransform:
             label["texts"] = mix_texts
         return labels
 
+class AdaptiveMosaic(BaseMixTransform):
+    """
+    Adaptive Mosaic augmentation that intelligently selects between CustomMosaic and EnhancedCustomMosaic
+    based on image class criteria.
+    
+    Selection Logic:
+    - If image has classes outside target_class_lst: Use only CustomMosaic
+    - If image has one unique class in target_class_lst OR no classes: 
+      Randomly select between CustomMosaic (30%) and EnhancedCustomMosaic (70%)
+    
+    Attributes:
+        dataset: The dataset on which the mosaic augmentation is applied.
+        imgsz (int): Image size after mosaic pipeline.
+        p (float): Probability of applying mosaic augmentation.
+        n (int): Grid size (3, 4, or 9).
+        target_class_lst (List[int]): List of target class IDs for filtering.
+        enhanced_weight (float): Weight for selecting EnhancedCustomMosaic (default: 0.7).
+    """
+    
+    def __init__(self, dataset, imgsz=640, p=1.0, n=4, target_class_lst=[3], enhanced_weight=0.7):
+        """
+        Initialize the Adaptive Mosaic augmentation object.
+        
+        Args:
+            dataset (Any): The dataset on which the mosaic augmentation is applied.
+            imgsz (int): Image size after mosaic pipeline.
+            p (float): Probability of applying mosaic augmentation.
+            n (int): Grid size (3, 4, or 9).
+            target_class_lst (List[int], optional): List of target class IDs for filtering.
+            enhanced_weight (float): Weight for selecting EnhancedCustomMosaic (0.7 = 70%).
+        """
+        assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
+        assert n in {3, 4, 9}, "grid must be equal to 3, 4, or 9."
+        assert 0 <= enhanced_weight <= 1.0, f"enhanced_weight should be in range [0, 1], but got {enhanced_weight}."
+        
+        super().__init__(dataset=dataset, p=p)
+        self.imgsz = imgsz
+        self.n = n
+        self.target_class_lst = target_class_lst if target_class_lst is not None else []
+        self.enhanced_weight = enhanced_weight
+        
+        # Initialize both mosaic transforms
+        self.custom_mosaic = CustomMosaic(
+            dataset=dataset, 
+            imgsz=imgsz, 
+            p=1.0,  # We handle probability at this level
+            n=n
+        )
+        
+        self.enhanced_custom_mosaic = EnhancedCustomMosaic(
+            dataset=dataset,
+            imgsz=imgsz,
+            p=1.0,  # We handle probability at this level
+            n=n,
+            target_class_lst=target_class_lst
+        )
+        
+        self.buffer_enabled = self.dataset.cache != "ram"
+    
+    def _analyze_image_classes(self, labels):
+        """
+        Analyze image classes to determine which mosaic method to use.
+        
+        Args:
+            labels (dict): Labels dictionary containing class information.
+            
+        Returns:
+            str: 'custom_only', 'both_allowed'
+        """
+        if not self.target_class_lst:
+            return 'both_allowed'
+            
+        cls = labels.get("cls", [])
+        
+        # If no classes in image, both methods are allowed
+        if len(cls) == 0:
+            return 'both_allowed'
+        
+        # Get unique classes in the image
+        unique_classes = np.unique(cls.flatten() if hasattr(cls, 'flatten') else cls)
+        
+        # Check if any class is outside target_class_lst
+        for class_id in unique_classes:
+            if class_id not in self.target_class_lst:
+                return 'custom_only'
+        
+        # Check if image has exactly one unique class in target_class_lst
+        if len(unique_classes) == 1 and unique_classes[0] in self.target_class_lst:
+            return 'both_allowed'
+        
+        # Multiple classes but all in target_class_lst - use custom only for safety
+        if len(unique_classes) > 1:
+            return 'custom_only'
+            
+        return 'both_allowed'
+    
+    def _select_mosaic_method(self, class_analysis):
+        """
+        Select which mosaic method to use based on class analysis.
+        
+        Args:
+            class_analysis (str): Result from _analyze_image_classes
+            
+        Returns:
+            str: 'custom' or 'enhanced'
+        """
+        if class_analysis == 'custom_only':
+            return 'custom'
+        elif class_analysis == 'both_allowed':
+            # Random selection with enhanced_weight preference for EnhancedCustomMosaic
+            return 'enhanced' if random.random() < self.enhanced_weight else 'custom'
+        else:
+            return 'custom'  # fallback
+    
+    def get_indexes(self, current_index=None):
+        """
+        Return a list of random indexes from the dataset for mosaic augmentation.
+        
+        Args:
+            current_index (int, optional): Current image index to exclude from selection.
+            
+        Returns:
+            List[int]: List of random image indexes for mosaic.
+        """
+        # Use CustomMosaic's get_indexes as fallback, but ensure we have enough images
+        indexes = self.custom_mosaic.get_indexes()
+        
+        # Ensure we have minimum required images for mosaic
+        min_required = max(2, self.n - 1)  # At least 2 images for mosaic (including current)
+        
+        if len(indexes) < min_required:
+            # Try to get more images from dataset
+            available_range = list(range(len(self.dataset)))
+            if current_index is not None and current_index in available_range:
+                available_range.remove(current_index)
+            
+            # Fill up to minimum required
+            while len(indexes) < min_required and available_range:
+                candidate = random.choice(available_range)
+                if candidate not in indexes:
+                    indexes.append(candidate)
+                available_range.remove(candidate)
+        
+        return indexes
+    
+    def _prepare_mix_labels(self, labels, selected_method, indexes):
+        """
+        Prepare mix_labels for the selected mosaic method.
+        
+        Args:
+            labels (dict): Original labels dictionary
+            selected_method (str): Selected mosaic method ('custom' or 'enhanced')
+            indexes (List[int]): List of image indexes for mosaic
+            
+        Returns:
+            dict: Labels with mix_labels prepared
+        """
+        if not indexes:
+            return labels
+            
+        mix_labels = []
+        for idx in indexes:
+            try:
+                # Get image and label data
+                if hasattr(self.dataset, 'get_image_and_label'):
+                    mix_label = self.dataset.get_image_and_label(idx)
+                else:
+                    # Fallback method
+                    mix_label = self.dataset[idx]
+                mix_labels.append(mix_label)
+            except Exception as e:
+                print(f"Warning: Could not load image at index {idx}: {e}")
+                continue
+        
+        # Update labels with mix_labels
+        labels["mix_labels"] = mix_labels
+        return labels
+    
+    def _mix_transform(self, labels):
+        """
+        Apply adaptive mosaic augmentation to the input image and labels.
+        
+        This method analyzes the image classes and selects the appropriate mosaic method
+        based on the defined criteria.
+        
+        Args:
+            labels (dict): A dictionary containing image data and annotations.
+            
+        Returns:
+            (dict): A dictionary containing the mosaic-augmented image and updated annotations.
+        """
+        # Get current image index if available
+        current_index = getattr(labels, 'index', None)
+        
+        # Get indexes for mosaic
+        indexes = self.get_indexes(current_index)
+        
+        # If not enough images for mosaic, return original
+        if len(indexes) < max(2, self.n - 1):
+            print(f"Warning: Not enough images for mosaic (need {self.n-1}, got {len(indexes)}). Returning original image.")
+            return labels
+        
+        # Analyze image classes to determine strategy
+        class_analysis = self._analyze_image_classes(labels)
+        
+        # Select mosaic method based on analysis
+        selected_method = self._select_mosaic_method(class_analysis)
+        
+        # Prepare mix_labels
+        labels = self._prepare_mix_labels(labels, selected_method, indexes)
+        
+        # Ensure we have mix_labels
+        if not labels.get("mix_labels"):
+            print("Warning: No mix_labels available. Returning original image.")
+            return labels
+        
+        # Apply selected mosaic method
+        if selected_method == 'enhanced':
+            # Use EnhancedCustomMosaic
+            try:
+                result = self.enhanced_custom_mosaic._mix_transform(labels)
+                # Add metadata about which method was used
+                result['mosaic_method'] = 'enhanced'
+                return result
+            except Exception as e:
+                # Fallback to CustomMosaic if EnhancedCustomMosaic fails
+                print(f"EnhancedCustomMosaic failed, falling back to CustomMosaic: {e}")
+                try:
+                    result = self.custom_mosaic._mix_transform(labels)
+                    result['mosaic_method'] = 'custom_fallback'
+                    return result
+                except Exception as e2:
+                    print(f"CustomMosaic also failed: {e2}. Returning original image.")
+                    return labels
+        else:
+            # Use CustomMosaic
+            try:
+                result = self.custom_mosaic._mix_transform(labels)
+                result['mosaic_method'] = 'custom'
+                return result
+            except Exception as e:
+                print(f"CustomMosaic failed: {e}. Returning original image.")
+                return labels
+    
+    def __call__(self, labels):
+        """
+        Apply the adaptive mosaic transformation with the specified probability.
+        
+        Args:
+            labels (dict): A dictionary containing image data and annotations.
+            
+        Returns:
+            (dict): A dictionary containing the processed image and updated annotations.
+        """
+        # if random.random() < self.p:
+        #     return self._mix_transform(labels)
+        # return labels
+        return self._mix_transform(labels)
+
+class EnhancedCustomMosaic(BaseMixTransform):
+    """
+    Custom Mosaic augmentation with target class filtering.
+
+    This class performs mosaic augmentation by combining multiple (4 or 9) images into a single mosaic image,
+    but only applies to images that contain a unique class ID from the target_class_lst or have no classes.
+
+    Attributes:
+        dataset: The dataset on which the mosaic augmentation is applied.
+        imgsz (int): Image size (height and width) after mosaic pipeline of a single image.
+        p (float): Probability of applying the mosaic augmentation. Must be in the range 0-1.
+        n (int): The grid size, either 4 (for 2x2) or 9 (for 3x3).
+        border (Tuple[int, int]): Border size for width and height.
+        target_class_lst (List[int], optional): List of target class IDs for filtering.
+
+    Methods:
+        _is_valid_image: Check if image meets the target class criteria.
+        _find_valid_candidates: Find valid images for mosaic from dataset.
+        get_indexes: Return a list of valid random indexes from the dataset.
+        _mix_transform: Apply mixup transformation to the input image and labels.
+        _mosaic3: Create a 1x3 image mosaic.
+        _mosaic4: Create a 2x2 image mosaic.
+        _mosaic9: Create a 3x3 image mosaic.
+        _update_labels: Update labels with padding.
+        _cat_labels: Concatenate labels and clips mosaic border instances.
+    """
+
+    def __init__(self, dataset, imgsz=640, p=1.0, n=4, target_class_lst=None):
+        """
+        Initialize the Custom Mosaic augmentation object.
+
+        Args:
+            dataset (Any): The dataset on which the mosaic augmentation is applied.
+            imgsz (int): Image size (height and width) after mosaic pipeline of a single image.
+            p (float): Probability of applying the mosaic augmentation. Must be in the range 0-1.
+            n (int): The grid size, either 4 (for 2x2) or 9 (for 3x3).
+            target_class_lst (List[int], optional): List of target class IDs for filtering.
+        """
+        assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
+        assert n in {4, 9}, "grid must be equal to 4 or 9."
+        super().__init__(dataset=dataset, p=p)
+        self.imgsz = imgsz
+        self.border = (-imgsz // 2, -imgsz // 2)  # width, height
+        self.n = n
+        self.target_class_lst = target_class_lst if target_class_lst is not None else []
+        self.buffer_enabled = self.dataset.cache != "ram"
+
+    def _is_valid_image(self, label_dict: Dict[str, Any]) -> bool:
+        """
+        Check if an image meets the target class criteria.
+        
+        Args:
+            label_dict (Dict[str, Any]): Label dictionary containing class information.
+            
+        Returns:
+            (bool): True if image is valid for mosaic, False otherwise.
+        """
+        if not self.target_class_lst:
+            return True
+            
+        cls = label_dict.get("cls", [])
+        
+        # If no classes in image, it's valid
+        if len(cls) == 0:
+            return True
+            
+        # Get unique classes in the image
+        unique_classes = np.unique(cls.flatten() if hasattr(cls, 'flatten') else cls)
+        
+        # Check if image has exactly one unique class and it's in target_class_lst
+        if len(unique_classes) == 1 and (len(self.target_class_lst) or unique_classes[0] in self.target_class_lst):
+            return True
+            
+        return False
+
+    def _find_valid_candidates(self, exclude_index: int = None) -> List[int]:
+        """
+        Find valid images for mosaic from dataset.
+        
+        Args:
+            exclude_index (int, optional): Index to exclude from candidates.
+            
+        Returns:
+            (List[int]): List of valid image indices.
+        """
+        valid_indices = []
+        
+        if self.buffer_enabled:
+            # Check buffer images
+            for idx in self.dataset.buffer:
+                if exclude_index is not None and idx == exclude_index:
+                    continue
+                # Get label info from dataset
+                label_info = self.dataset.labels[idx] if hasattr(self.dataset, 'labels') else None
+                if label_info and self._is_valid_image(label_info):
+                    valid_indices.append(idx)
+        else:
+            # Check all dataset images
+            for idx in range(len(self.dataset)):
+                if exclude_index is not None and idx == exclude_index:
+                    continue
+                # Get label info from dataset
+                label_info = self.dataset.labels[idx] if hasattr(self.dataset, 'labels') else None
+                if label_info and self._is_valid_image(label_info):
+                    valid_indices.append(idx)
+        
+        return valid_indices
+
+    def get_indexes(self, current_index: int = None):
+        """
+        Return a list of valid random indexes from the dataset for mosaic augmentation.
+
+        Args:
+            current_index (int, optional): Current image index to exclude from candidates.
+
+        Returns:
+            (List[int]): A list of valid random image indexes. The length may be less than n-1
+                if not enough valid images are found.
+        """
+        valid_candidates = self._find_valid_candidates(exclude_index=current_index)
+        
+        if not valid_candidates:
+            return []
+            
+        # Return random selection from valid candidates
+        max_select = min(len(valid_candidates), self.n - 1)
+        return random.sample(valid_candidates, max_select)
+
+    def _mix_transform(self, labels):
+        """
+        Apply mosaic augmentation to the input image and labels.
+
+        This method combines multiple images into a single mosaic image based on the 'n' attribute,
+        but only if the current image and candidate images meet the target class criteria.
+
+        Args:
+            labels (dict): A dictionary containing image data and annotations.
+
+        Returns:
+            (dict): A dictionary containing the mosaic-augmented image and updated annotations,
+                or original labels if mosaic conditions are not met.
+        """
+        # Check if current image is valid for mosaic
+        if not self._is_valid_image(labels):
+            return labels
+            
+        # Get current image index if available
+        current_index = getattr(labels, 'index', None)
+        
+        # Get valid candidate indices
+        valid_indices = self.get_indexes(current_index)
+        
+        # If no valid candidates or only current image, return original
+        if len(valid_indices) == 0:
+            return labels
+            
+        # Create mix_labels with valid candidates
+        mix_labels = []
+        for idx in valid_indices:
+            # Get label data for the candidate image
+            candidate_label = self.dataset.get_image_and_label(idx)
+            mix_labels.append(candidate_label)
+        
+        # Update labels with mix_labels
+        labels["mix_labels"] = mix_labels
+        
+        # Ensure we don't have rect_shape for mosaic
+        labels.pop("rect_shape", None)
+        
+        # Apply appropriate mosaic based on number of available images
+        available_images = len(mix_labels) + 1  # +1 for current image
+        
+        if available_images >= 4 and self.n == 4:
+            return self._mosaic4(labels)
+        elif available_images >= 9 and self.n == 9:
+            return self._mosaic9(labels)
+        elif available_images >= 3:
+            return self._mosaic3(labels)
+        else:
+            # Not enough images for mosaic, return original
+            return labels
+
+    def _mosaic3(self, labels):
+        """
+        Create a 1x3 image mosaic by combining up to three images.
+        Handles cases where fewer than 3 images are available.
+        """
+        mosaic_labels = []
+        s = self.imgsz
+        available_mix = len(labels.get("mix_labels", []))
+        
+        for i in range(3):
+            if i == 0:
+                labels_patch = labels
+            elif i - 1 < available_mix:
+                labels_patch = labels["mix_labels"][i - 1]
+            else:
+                # No more images available, skip this position
+                continue
+                
+            # Load image
+            img = labels_patch["img"]
+            h, w = labels_patch.pop("resized_shape")
+
+            # Place img in img3
+            if i == 0:  # center
+                img3 = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=np.uint8)
+                h0, w0 = h, w
+                c = s, s, s + w, s + h
+            elif i == 1:  # right
+                c = s + w0, s, s + w0 + w, s + h
+            elif i == 2:  # left
+                c = s - w, s + h0 - h, s, s + h0
+
+            padw, padh = c[:2]
+            x1, y1, x2, y2 = (max(x, 0) for x in c)
+
+            img3[y1:y2, x1:x2] = img[y1 - padh:, x1 - padw:]
+            
+            labels_patch = self._update_labels(labels_patch, padw + self.border[0], padh + self.border[1])
+            mosaic_labels.append(labels_patch)
+            
+        final_labels = self._cat_labels(mosaic_labels)
+        final_labels["img"] = img3[-self.border[0]: self.border[0], -self.border[1]: self.border[1]]
+        return final_labels
+
+    def _mosaic4(self, labels):
+        """
+        Create a 2x2 image mosaic from available input images.
+        Handles cases where fewer than 4 images are available.
+        """
+        mosaic_labels = []
+        s = self.imgsz
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.border)
+        available_mix = len(labels.get("mix_labels", []))
+        
+        for i in range(4):
+            if i == 0:
+                labels_patch = labels
+            elif i - 1 < available_mix:
+                labels_patch = labels["mix_labels"][i - 1]
+            else:
+                # No more images available, skip this position
+                continue
+                
+            # Load image
+            img = labels_patch["img"]
+            h, w = labels_patch.pop("resized_shape")
+
+            # Place img in img4
+            if i == 0:  # top left
+                img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            elif i == 3:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+
+            img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+            padw = x1a - x1b
+            padh = y1a - y1b
+
+            labels_patch = self._update_labels(labels_patch, padw, padh)
+            mosaic_labels.append(labels_patch)
+            
+        final_labels = self._cat_labels(mosaic_labels)
+        final_labels["img"] = img4
+        return final_labels
+
+    def _mosaic9(self, labels):
+        """
+        Create a 3x3 image mosaic from available input images.
+        Handles cases where fewer than 9 images are available.
+        """
+        mosaic_labels = []
+        s = self.imgsz
+        hp, wp = -1, -1
+        available_mix = len(labels.get("mix_labels", []))
+        
+        for i in range(9):
+            if i == 0:
+                labels_patch = labels
+            elif i - 1 < available_mix:
+                labels_patch = labels["mix_labels"][i - 1]
+            else:
+                # No more images available, skip this position
+                continue
+                
+            # Load image
+            img = labels_patch["img"]
+            h, w = labels_patch.pop("resized_shape")
+
+            # Place img in img9
+            if i == 0:  # center
+                img9 = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=np.uint8)
+                h0, w0 = h, w
+                c = s, s, s + w, s + h
+            elif i == 1:  # top
+                c = s, s - h, s + w, s
+            elif i == 2:  # top right
+                c = s + wp, s - h, s + wp + w, s
+            elif i == 3:  # right
+                c = s + w0, s, s + w0 + w, s + h
+            elif i == 4:  # bottom right
+                c = s + w0, s + hp, s + w0 + w, s + hp + h
+            elif i == 5:  # bottom
+                c = s + w0 - w, s + h0, s + w0, s + h0 + h
+            elif i == 6:  # bottom left
+                c = s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h
+            elif i == 7:  # left
+                c = s - w, s + h0 - h, s, s + h0
+            elif i == 8:  # top left
+                c = s - w, s + h0 - hp - h, s, s + h0 - hp
+
+            padw, padh = c[:2]
+            x1, y1, x2, y2 = (max(x, 0) for x in c)
+
+            img9[y1:y2, x1:x2] = img[y1 - padh:, x1 - padw:]
+            hp, wp = h, w
+
+            labels_patch = self._update_labels(labels_patch, padw + self.border[0], padh + self.border[1])
+            mosaic_labels.append(labels_patch)
+            
+        final_labels = self._cat_labels(mosaic_labels)
+        final_labels["img"] = img9[-self.border[0]: self.border[0], -self.border[1]: self.border[1]]
+        return final_labels
+
+    @staticmethod
+    def _update_labels(labels, padw, padh):
+        """
+        Update label coordinates with padding values.
+        """
+        nh, nw = labels["img"].shape[:2]
+        labels["instances"].convert_bbox(format="xyxy")
+        labels["instances"].denormalize(nw, nh)
+        labels["instances"].add_padding(padw, padh)
+        return labels
+
+    def _cat_labels(self, mosaic_labels):
+        """
+        Concatenate and process labels for mosaic augmentation.
+        """
+        if len(mosaic_labels) == 0:
+            return {}
+            
+        cls = []
+        instances = []
+        imgsz = self.imgsz * 2
+        
+        for labels in mosaic_labels:
+            cls.append(labels["cls"])
+            instances.append(labels["instances"])
+            
+        # Final labels
+        final_labels = {
+            "im_file": mosaic_labels[0]["im_file"],
+            "ori_shape": mosaic_labels[0]["ori_shape"],
+            "resized_shape": (imgsz, imgsz),
+            "cls": np.concatenate(cls, 0),
+            "instances": Instances.concatenate(instances, axis=0),
+            "mosaic_border": self.border,
+        }
+        
+        final_labels["instances"].clip(imgsz, imgsz)
+        good = final_labels["instances"].remove_zero_area_boxes()
+        final_labels["cls"] = final_labels["cls"][good]
+        
+        if "texts" in mosaic_labels[0]:
+            final_labels["texts"] = mosaic_labels[0]["texts"]
+            
+        return final_labels
+
 class CustomMosaic(BaseMixTransform):
     """
     Refactored Mosaic class with letterbox resizing and no cropping
